@@ -49,7 +49,8 @@ decision but matters for judgment:
 - **India VIX** — printed when available; above 17 it tightens the
   premium-fairness condition's threshold from 1.10 to 1.05.
 - **Event-day / expiry-day warning** — a prominent "IV-CRUSH RISK" flag
-  on RBI MPC days, Union Budget day, or the last day before expiry.
+  on RBI MPC days (verified FY27 dates), the day before each MPC
+  decision, Union Budget day, or the last day before expiry.
 
 Realized volatility comes from 30 daily closes via `yfinance`
 (`^NSEBANK`/`^NSEI`), or a manual `closes.csv` fallback (one close per

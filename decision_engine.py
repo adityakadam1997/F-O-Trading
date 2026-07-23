@@ -44,7 +44,7 @@ import csv
 import math
 import os
 import statistics
-from datetime import date, datetime, time as dtime
+from datetime import date, datetime, time as dtime, timedelta
 
 import option_analyzer as oa
 
@@ -75,18 +75,24 @@ YF_INDEX_TICKERS = {"BANKNIFTY": "^NSEBANK", "NIFTY": "^NSEI"}
 YF_INDIA_VIX_TICKER = "^INDIAVIX"
 CLOSES_CSV_FILE = "closes.csv"
 
-# RBI MPC decision dates are bi-monthly; Union Budget is 1 Feb. These are
-# PLACEHOLDER dates based on RBI's typical cadence - verify against the
-# official RBI MPC calendar (rbi.org.in) and correct before relying on
-# this for real event-day flagging.
-EVENT_DATES_2026 = {
-    date(2026, 2, 1): "Union Budget",
-    date(2026, 2, 6): "RBI MPC decision",
-    date(2026, 4, 8): "RBI MPC decision",
-    date(2026, 6, 5): "RBI MPC decision",
-    date(2026, 8, 6): "RBI MPC decision",
-    date(2026, 10, 7): "RBI MPC decision",
-    date(2026, 12, 4): "RBI MPC decision",
+# Verified FY27 RBI MPC announcement dates, plus Union Budget 2026-02-01.
+MPC_DATES_2026 = [
+    date(2026, 4, 8),
+    date(2026, 6, 5),
+    date(2026, 8, 5),
+    date(2026, 10, 7),
+    date(2026, 12, 4),
+]
+BUDGET_DATE_2026 = date(2026, 2, 1)
+
+EVENT_DATES_2026 = {BUDGET_DATE_2026: "Union Budget"}
+EVENT_DATES_2026.update({d: "RBI MPC decision" for d in MPC_DATES_2026})
+
+# The day before each MPC announcement carries elevated IV-crush risk in
+# its own right (positioning/unwind ahead of the decision).
+PRE_MPC_DATES_2026 = {
+    d - timedelta(days=1): "day before RBI MPC decision (elevated IV-crush risk)"
+    for d in MPC_DATES_2026
 }
 
 LOG_FILE = "decisions_log.csv"
@@ -279,11 +285,13 @@ def compute_max_pain(rows):
 
 
 def event_day_status(now, T_days):
-    """Returns (is_event_day, label). Hard-coded 2026 events take
-    priority; otherwise expiry day itself (<=1 day left) is flagged."""
+    """Returns (is_event_day, label). Priority: the event day itself, then
+    the day before an MPC decision, then expiry day (<=1 day left)."""
     today = now.date()
     if today in EVENT_DATES_2026:
         return True, EVENT_DATES_2026[today]
+    if today in PRE_MPC_DATES_2026:
+        return True, PRE_MPC_DATES_2026[today]
     if T_days <= 1:
         return True, "expiry day"
     return False, None

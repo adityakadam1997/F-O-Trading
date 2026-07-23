@@ -241,12 +241,14 @@ Four context/condition additions layered on top of the core 6:
   VIX is pure context, unlike the RV fetch which prints why it failed
   since a missing RV blocks a BUY.
 - **Event-day flag** (`event_day_status()`) — a hardcoded 2026 event
-  calendar (`EVENT_DATES_2026`: Union Budget, RBI MPC decision dates —
-  **placeholder dates based on RBI's typical bi-monthly cadence; verify
-  against the official RBI MPC calendar at rbi.org.in before relying on
-  this**) plus a dynamic rule (`days_to_expiry <= 1` = expiry day). On a
-  flagged day, prints a prominent "IV-CRUSH RISK" warning and logs it
-  (`event_flag`/`event_label` columns in `decisions_log.csv`).
+  calendar: Union Budget (2026-02-01) and the verified FY27 RBI MPC
+  announcement dates (`MPC_DATES_2026`: 2026-04-08, 2026-06-05,
+  2026-08-05, 2026-10-07, 2026-12-04). The day **before** each MPC date
+  (`PRE_MPC_DATES_2026`) is separately flagged as elevated IV-crush risk
+  ahead of the decision. A dynamic rule (`days_to_expiry <= 1` = expiry
+  day) applies when none of the above match. On any flagged day, prints
+  a prominent "IV-CRUSH RISK" warning and logs it (`event_flag`/
+  `event_label` columns in `decisions_log.csv`).
 
 ### Phase 2 stubs
 
@@ -288,8 +290,8 @@ unless a task explicitly says so):
   before and reverted; revisit only if explicitly requested.
 - IV rank/percentile once `iv_history.csv` has ~60 days of accumulated
   ATM IV — not implemented yet, just logged in preparation for it.
-- Verify/correct the placeholder `EVENT_DATES_2026` RBI MPC dates against
-  the official calendar.
+- `MPC_DATES_2026`/`BUDGET_DATE_2026` only cover 2026; extend with FY28
+  dates once RBI publishes its next calendar.
 - Cross-rank CE and PE together in one chain scan instead of requiring a
   side to be picked upfront (carried over from `option_analyzer.py`'s
   now-reverted scanner idea).
