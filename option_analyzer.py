@@ -53,13 +53,14 @@ def bs_greeks(S, K, T, r, iv, opt):
     d1 = (math.log(S / K) + (r + iv * iv / 2) * T) / (iv * math.sqrt(T))
     d2 = d1 - iv * math.sqrt(T)
     delta = norm_cdf(d1) if opt == "CE" else norm_cdf(d1) - 1
+    gamma = norm_pdf(d1) / (S * iv * math.sqrt(T))
     common = -(S * norm_pdf(d1) * iv) / (2 * math.sqrt(T))
     if opt == "CE":
         theta = (common - r * K * math.exp(-r * T) * norm_cdf(d2)) / 365
     else:
         theta = (common + r * K * math.exp(-r * T) * norm_cdf(-d2)) / 365
     vega = S * norm_pdf(d1) * math.sqrt(T) / 100
-    return delta, theta, vega
+    return delta, gamma, theta, vega
 
 
 def implied_vol(price, S, K, T, r, opt):
@@ -284,7 +285,7 @@ def main():
         print(f"Backed-out IV from premium: {iv * 100:.1f}%")
 
     fair = bs_price(S, strike, T, r, iv, opt)
-    delta, theta, vega = bs_greeks(S, strike, T, r, iv, opt)
+    delta, gamma, theta, vega = bs_greeks(S, strike, T, r, iv, opt)
     breakeven = strike + premium if opt == "CE" else strike - premium
     pts_needed = (breakeven - S) if opt == "CE" else (S - breakeven)
     target = premium * (1 + TARGET_PCT)
@@ -314,7 +315,11 @@ def main():
     print(f"  {symbol} {strike} {opt} | premium Rs {premium}")
     print("=" * 60)
     print(f"  Fair value (BS)     : Rs {fair:.1f}")
-    print(f"  Delta / Theta / Vega: {delta:.2f} / {theta:.1f}/day / {vega:.1f}")
+    print(f"  Delta / Gamma / Theta / Vega: {delta:.2f} / {gamma:.4f} / "
+          f"{theta:.1f}/day / {vega:.1f}")
+    if T_days <= 2:
+        print("  *** GAMMA-DAY CAUTION: <=2 days to expiry - gamma is elevated, "
+              "small index moves swing the premium sharply either way. ***")
     print(f"  Breakeven at expiry : {breakeven:.0f} ({pts_needed:.0f} pts away)")
     print(f"  Target / Stop-loss  : Rs {target:.1f} / Rs {stop:.1f}")
     print("-" * 60)

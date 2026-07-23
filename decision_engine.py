@@ -8,7 +8,7 @@ This is NOT a prediction tool. It reports whether a fixed set of
 objective, observable conditions currently point the same way. When they
 don't - which is most of the time - the honest answer is WAIT. There is
 no confidence score, no probability, no expected holding time anywhere
-in this tool; only "N/6 conditions aligned" plus the actual value behind
+in this tool; only "N/7 conditions aligned" plus the actual value behind
 each one, so you can see for yourself what's missing.
 
 Flow:
@@ -17,25 +17,34 @@ Flow:
   2. Find the nearest strike below and above spot; analyze only those
      two strikes, CE and PE both (4 contracts).
   3. Classify each leg's OI buildup from today's price change + OI change.
-  4. Evaluate 6 objective conditions (OI signal, PCR, volume vs chain
+  4. Evaluate 7 objective conditions (OI signal, PCR, volume vs chain
      average, premium fairness vs Black-Scholes, risk-reward/breakeven
-     achievable in the hours left today, time-of-day filter).
-  5. BUY only when all 6 align in one direction. Otherwise WAIT (some
+     achievable in the hours left today, time-of-day filter, and realized
+     vol vs IV).
+  5. BUY only when all 7 align in one direction. Otherwise WAIT (some
      conditions conflict) or NO TRADE (volume below average, or a hard
      no-trade time window is active).
+  6. Alongside the 7 conditions, prints context that doesn't gate the
+     decision but matters for judgment: max pain, India VIX (which also
+     tightens the premium-fairness threshold when elevated), and an
+     event-day/expiry-day IV-crush warning.
 
 Falls back to manual entry (typed spot/strikes/OI/volume/premium per
 leg) if the NSE fetch fails, same as option_analyzer.py. Every run is
 logged to decisions_log.csv (gitignored) regardless of the decision.
+Every run also appends the ATM IV to iv_history.csv (gitignored) so a
+future IV-rank feature has data to work with once ~60 days accumulate.
 
 Run:  python decision_engine.py
-Needs: pip install requests (only for the live NSE fetch)
+Needs: pip install requests (NSE fetch), pip install yfinance (realized
+vol / India VIX - optional; both degrade gracefully without it)
 """
 
 import csv
+import math
 import os
-from datetime import datetime, time as dtime
-from statistics import mean
+import statistics
+from datetime import date, datetime, time as dtime
 
 import option_analyzer as oa
 
@@ -56,14 +65,42 @@ NO_TRADE_WINDOWS = [
 ]
 LUNCH_WINDOW = (dtime(12, 0), dtime(13, 15))
 
+FAIRNESS_THRESHOLD = 1.10           # tightened to 1.05 when India VIX > 17
+FAIRNESS_THRESHOLD_HIGH_VIX = 1.05
+VIX_TIGHTEN_LEVEL = 17.0
+RV_IV_THRESHOLD = 1.10              # option IV / realized vol must be <= this
+RV_LOOKBACK_DAYS = 30
+
+YF_INDEX_TICKERS = {"BANKNIFTY": "^NSEBANK", "NIFTY": "^NSEI"}
+YF_INDIA_VIX_TICKER = "^INDIAVIX"
+CLOSES_CSV_FILE = "closes.csv"
+
+# RBI MPC decision dates are bi-monthly; Union Budget is 1 Feb. These are
+# PLACEHOLDER dates based on RBI's typical cadence - verify against the
+# official RBI MPC calendar (rbi.org.in) and correct before relying on
+# this for real event-day flagging.
+EVENT_DATES_2026 = {
+    date(2026, 2, 1): "Union Budget",
+    date(2026, 2, 6): "RBI MPC decision",
+    date(2026, 4, 8): "RBI MPC decision",
+    date(2026, 6, 5): "RBI MPC decision",
+    date(2026, 8, 6): "RBI MPC decision",
+    date(2026, 10, 7): "RBI MPC decision",
+    date(2026, 12, 4): "RBI MPC decision",
+}
+
 LOG_FILE = "decisions_log.csv"
 LOG_FIELDS = [
     "timestamp", "symbol", "spot", "strike_below", "strike_above",
     "ce_below_buildup", "ce_above_buildup", "pe_below_buildup",
     "pe_above_buildup", "pcr", "oi_bias", "volume_ok", "fairness_ratio",
-    "pts_needed", "score", "total", "decision", "candidate_opt",
-    "candidate_strike",
+    "fairness_threshold", "pts_needed", "rv", "rv_source", "iv_rv_ratio",
+    "vix", "max_pain", "event_flag", "event_label", "score", "total",
+    "decision", "candidate_opt", "candidate_strike",
 ]
+
+IV_HISTORY_FILE = "iv_history.csv"
+IV_HISTORY_FIELDS = ["date", "atm_iv"]
 # ------------------------------------------------------------
 
 
@@ -145,6 +182,123 @@ def nearest_strikes(strikes, spot):
     return max(below_list), min(above_list)
 
 
+def realized_vol(closes):
+    """Annualized realized vol from a list of daily closes (oldest first):
+    stdev of log returns * sqrt(252). None if there aren't enough closes
+    for at least 2 log returns."""
+    if not closes or len(closes) < 3:
+        return None
+    log_returns = [math.log(closes[i] / closes[i - 1])
+                   for i in range(1, len(closes)) if closes[i - 1] > 0]
+    if len(log_returns) < 2:
+        return None
+    return statistics.stdev(log_returns) * math.sqrt(252)
+
+
+def fetch_realized_vol_yfinance(yf_symbol, days=RV_LOOKBACK_DAYS):
+    try:
+        import yfinance as yf
+    except ImportError:
+        return None
+    try:
+        hist = yf.Ticker(yf_symbol).history(period=f"{days + 20}d")
+        closes = hist["Close"].dropna().tolist()
+    except Exception as e:
+        print(f"  [!] yfinance fetch for {yf_symbol} failed: {e}")
+        return None
+    return closes[-days:] if len(closes) >= 3 else None
+
+
+def load_closes_csv(path=CLOSES_CSV_FILE):
+    """Manual fallback: one close per line, oldest first."""
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path) as f:
+            closes = [float(line.strip()) for line in f if line.strip()]
+    except (OSError, ValueError) as e:
+        print(f"  [!] Could not read {path}: {e}")
+        return None
+    return closes if len(closes) >= 3 else None
+
+
+def fetch_realized_vol(symbol, days=RV_LOOKBACK_DAYS):
+    """Try yfinance first (^NSEBANK/^NSEI), then a manual closes.csv
+    fallback. Returns (rv, source) or (None, None)."""
+    yf_symbol = YF_INDEX_TICKERS.get(symbol, "^NSEI")
+    closes = fetch_realized_vol_yfinance(yf_symbol, days)
+    if closes:
+        rv = realized_vol(closes)
+        if rv:
+            return rv, "yfinance"
+    closes = load_closes_csv()
+    if closes:
+        rv = realized_vol(closes[-(days + 1):])
+        if rv:
+            return rv, "closes.csv"
+    return None, None
+
+
+def fetch_india_vix():
+    """India VIX via yfinance. Returns a float, or None on any failure -
+    fallback is to skip silently (no error printed), since VIX is
+    context, not a required condition. Output is redirected because
+    yfinance prints its own fetch errors directly rather than raising
+    only, which would otherwise defeat "skip silently"."""
+    import contextlib
+    import io
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+            import yfinance as yf
+            closes = yf.Ticker(YF_INDIA_VIX_TICKER).history(period="5d")["Close"].dropna()
+        return float(closes.iloc[-1]) if len(closes) else None
+    except Exception:
+        return None
+
+
+def compute_max_pain(rows):
+    """Strike that minimizes total option-writer payout obligation:
+    Pain(Kc) = sum(CE_OI(K) * max(Kc-K, 0)) + sum(PE_OI(K) * max(K-Kc, 0)).
+    None if there are fewer than 2 strikes with OI data."""
+    strikes = sorted({float(row["strikePrice"]) for row in rows
+                      if row.get("strikePrice") is not None})
+    if len(strikes) < 2:
+        return None
+    ce_oi = {float(row["strikePrice"]): (row.get("CE") or {}).get("openInterest") or 0
+             for row in rows if row.get("strikePrice") is not None}
+    pe_oi = {float(row["strikePrice"]): (row.get("PE") or {}).get("openInterest") or 0
+             for row in rows if row.get("strikePrice") is not None}
+    best_strike, best_pain = None, None
+    for kc in strikes:
+        pain = (sum(ce_oi[k] * max(kc - k, 0) for k in strikes) +
+                sum(pe_oi[k] * max(k - kc, 0) for k in strikes))
+        if best_pain is None or pain < best_pain:
+            best_pain, best_strike = pain, kc
+    return best_strike
+
+
+def event_day_status(now, T_days):
+    """Returns (is_event_day, label). Hard-coded 2026 events take
+    priority; otherwise expiry day itself (<=1 day left) is flagged."""
+    today = now.date()
+    if today in EVENT_DATES_2026:
+        return True, EVENT_DATES_2026[today]
+    if T_days <= 1:
+        return True, "expiry day"
+    return False, None
+
+
+def compute_atm_iv(S, strike_below, strike_above, legs):
+    """Average of CE/PE impliedVolatility (NSE-reported, in %) at
+    whichever of the two nearest strikes is closer to spot."""
+    prefix = "below" if abs(S - strike_below) <= abs(strike_above - S) else "above"
+    ce_iv = legs[("CE", prefix)].get("impliedVolatility") or 0
+    pe_iv = legs[("PE", prefix)].get("impliedVolatility") or 0
+    ivs = [v for v in (ce_iv, pe_iv) if v]
+    return (sum(ivs) / len(ivs)) if ivs else None
+
+
 def fetch_chain(symbol):
     """Fetch expiries, let the user pick one, then fetch that expiry's
     chain via option_analyzer's NSE helpers. Returns (rows, S, expiry) on
@@ -189,7 +343,7 @@ def parse_chain_to_legs(rows, S):
     volumes = [leg["totalTradedVolume"] for row in rows
                for leg in (row.get("CE"), row.get("PE"))
                if isinstance(leg, dict) and leg.get("totalTradedVolume") is not None]
-    avg_volume = mean(volumes) if volumes else 0
+    avg_volume = statistics.mean(volumes) if volumes else 0
     return below, above, legs, avg_volume
 
 
@@ -220,10 +374,20 @@ def oi_footprint_absorption(*args, **kwargs):
 
 
 def evaluate_decision(symbol, S, T_days, strike_below, strike_above, legs,
-                      avg_volume, capital, now=None):
-    """Run the 6 objective conditions on the 4 legs and return a decision
-    dict. `now` is injectable so the time-of-day filter is testable."""
+                      avg_volume, capital, now=None, rv=None, rv_source=None,
+                      vix=None, max_pain=None):
+    """Run the 7 objective conditions on the 4 legs and return a decision
+    dict. `now` is injectable so the time-of-day filter is testable; `rv`
+    (realized vol), `vix` (India VIX), and `max_pain` are injectable too
+    so tests don't need network/yfinance access - callers normally get
+    them from fetch_realized_vol(), fetch_india_vix(), and
+    compute_max_pain()."""
     now = now or datetime.now()
+    fairness_threshold = (FAIRNESS_THRESHOLD_HIGH_VIX
+                          if (vix is not None and vix > VIX_TIGHTEN_LEVEL)
+                          else FAIRNESS_THRESHOLD)
+    is_event_day, event_label = event_day_status(now, T_days)
+    atm_iv = compute_atm_iv(S, strike_below, strike_above, legs)
 
     buildups = {
         key: classify_oi_buildup(leg.get("pChange") or 0,
@@ -272,6 +436,7 @@ def evaluate_decision(symbol, S, T_days, strike_below, strike_above, legs,
     fairness_ok = False
     pts_needed = None
     rr_ok = False
+    iv = None
 
     if premium and premium > 0:
         T = T_days / 365
@@ -283,11 +448,14 @@ def evaluate_decision(symbol, S, T_days, strike_below, strike_above, legs,
                                iv, candidate_opt)
             if fair > 0:
                 fairness_ratio = premium / fair
-                fairness_ok = fairness_ratio <= 1.10
+                fairness_ok = fairness_ratio <= fairness_threshold
         breakeven = (candidate_strike + premium if candidate_opt == "CE"
                      else candidate_strike - premium)
         pts_needed = abs(breakeven - S)
         rr_ok = hours_left > 0 and pts_needed <= achievable_pts
+
+    iv_rv_ratio = (iv / rv) if (iv and rv) else None
+    rv_ok = iv_rv_ratio is not None and iv_rv_ratio <= RV_IV_THRESHOLD
 
     conditions = [
         {"name": "OI signal",
@@ -300,7 +468,7 @@ def evaluate_decision(symbol, S, T_days, strike_below, strike_above, legs,
         {"name": "Volume vs chain average",
          "passed": volume_ok,
          "detail": f"{volume:.0f} vs avg {avg_volume:.0f}"},
-        {"name": "Premium fairness (prem/fair <= 1.10)",
+        {"name": f"Premium fairness (prem/fair <= {fairness_threshold:.2f})",
          "passed": fairness_ok,
          "detail": f"{fairness_ratio:.2f}" if fairness_ratio is not None else "n/a"},
         {"name": "Risk-reward / breakeven achievable (RR fixed 2.0)",
@@ -311,6 +479,12 @@ def evaluate_decision(symbol, S, T_days, strike_below, strike_above, legs,
         {"name": "Time-of-day filter",
          "passed": not hard_no_trade,
          "detail": time_label},
+        {"name": f"Realized vol vs IV (IV/RV <= {RV_IV_THRESHOLD:.2f})",
+         "passed": rv_ok,
+         "detail": (f"IV {iv * 100:.1f}% / RV {rv * 100:.1f}% "
+                    f"(ratio {iv_rv_ratio:.2f}, source: {rv_source})")
+                   if iv_rv_ratio is not None
+                   else "n/a (no realized-vol data - install yfinance or provide closes.csv)"},
     ]
     score = sum(1 for c in conditions if c["passed"])
     total = len(conditions)
@@ -324,10 +498,10 @@ def evaluate_decision(symbol, S, T_days, strike_below, strike_above, legs,
                   f"average ({avg_volume:.0f}) - no participation to confirm the move.")
     elif score == total and direction == "bullish":
         decision = "BUY CE"
-        reason = "All 6 conditions align bullish at the nearest strikes."
+        reason = f"All {total} conditions align bullish at the nearest strikes."
     elif score == total and direction == "bearish":
         decision = "BUY PE"
-        reason = "All 6 conditions align bearish at the nearest strikes."
+        reason = f"All {total} conditions align bearish at the nearest strikes."
     else:
         decision = "WAIT"
         failing = "; ".join(f"{c['name']}: {c['detail']}"
@@ -345,6 +519,11 @@ def evaluate_decision(symbol, S, T_days, strike_below, strike_above, legs,
         "score": score, "total": total,
         "decision": decision, "reason": reason,
         "lunch_flag": lunch_flag, "capital": capital, "now": now,
+        "fairness_threshold": fairness_threshold,
+        "rv": rv, "rv_source": rv_source, "iv_rv_ratio": iv_rv_ratio,
+        "vix": vix, "max_pain": max_pain,
+        "is_event_day": is_event_day, "event_label": event_label,
+        "atm_iv": atm_iv,
     }
 
 
@@ -365,11 +544,27 @@ def print_decision(result):
     print(f"    PE {result['strike_below']:.0f}: {b['PE_below']}")
     print(f"    PE {result['strike_above']:.0f}: {b['PE_above']}")
     print("-" * 70)
+    if result["max_pain"] is not None:
+        diff = result["S"] - result["max_pain"]
+        direction = "above" if diff > 0 else "below" if diff < 0 else "at"
+        print(f"  Max pain: {result['max_pain']:.0f} (spot is {abs(diff):.0f} "
+              f"pts {direction} max pain)")
+    if result["vix"] is not None:
+        tightened = (" (premium-fairness threshold tightened to "
+                    f"{FAIRNESS_THRESHOLD_HIGH_VIX:.2f})"
+                    if result["fairness_threshold"] < FAIRNESS_THRESHOLD else "")
+        print(f"  India VIX: {result['vix']:.2f}{tightened}")
+    if result["is_event_day"]:
+        print(f"  *** IV-CRUSH RISK: {result['event_label']} - IV can collapse "
+              "independent of direction. ***")
+    if result["max_pain"] is not None or result["vix"] is not None or result["is_event_day"]:
+        print("-" * 70)
     print("  CONDITIONS:")
     for c in result["conditions"]:
         print(f"    [{'PASS' if c['passed'] else 'FAIL'}] {c['name']}  ({c['detail']})")
     print("-" * 70)
-    print(f"  ALIGNMENT SCORE: {result['score']}/{result['total']} conditions aligned")
+    print(f"  ALIGNMENT SCORE: {result['score']}/{result['total']} "
+          "conditions aligned")
     print(f"  DECISION: {result['decision']}")
     print(f"  Reason: {result['reason']}")
     if result["lunch_flag"]:
@@ -422,7 +617,16 @@ def log_decision(result, path=LOG_FILE):
         "oi_bias": result["oi_bias"],
         "volume_ok": volume_ok,
         "fairness_ratio": fairness_detail,
+        "fairness_threshold": result["fairness_threshold"],
         "pts_needed": pts_detail,
+        "rv": f"{result['rv']:.4f}" if result["rv"] is not None else "",
+        "rv_source": result["rv_source"] or "",
+        "iv_rv_ratio": (f"{result['iv_rv_ratio']:.2f}"
+                       if result["iv_rv_ratio"] is not None else ""),
+        "vix": f"{result['vix']:.2f}" if result["vix"] is not None else "",
+        "max_pain": result["max_pain"] if result["max_pain"] is not None else "",
+        "event_flag": result["is_event_day"],
+        "event_label": result["event_label"] or "",
         "score": result["score"],
         "total": result["total"],
         "decision": result["decision"],
@@ -435,6 +639,20 @@ def log_decision(result, path=LOG_FILE):
         if write_header:
             writer.writeheader()
         writer.writerow(row)
+
+
+def log_iv_history(now, atm_iv_value, path=IV_HISTORY_FILE):
+    """Append date + ATM IV so a future IV-rank feature has history to
+    work with. No-ops if ATM IV couldn't be computed for this run."""
+    if atm_iv_value is None:
+        return
+    write_header = not os.path.exists(path)
+    with open(path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=IV_HISTORY_FIELDS)
+        if write_header:
+            writer.writeheader()
+        writer.writerow({"date": now.date().isoformat(),
+                         "atm_iv": f"{atm_iv_value:.4f}"})
 
 
 def _manual_leg(label):
@@ -480,6 +698,7 @@ def main():
 
     now = datetime.now()
     rows, S, expiry = fetch_chain(symbol)
+    max_pain = None
     if rows is None:
         S, T_days, strike_below, strike_above, legs, avg_volume = manual_entry()
     else:
@@ -489,12 +708,19 @@ def main():
             return
         strike_below, strike_above, legs, avg_volume = parsed
         T_days = oa.days_between(expiry)
+        max_pain = compute_max_pain(rows)
         print(f"\nFetched: spot={S}, expiry={expiry}, days to expiry={T_days}")
 
+    rv, rv_source = fetch_realized_vol(symbol)
+    vix = fetch_india_vix()
+
     result = evaluate_decision(symbol, S, T_days, strike_below, strike_above,
-                               legs, avg_volume, capital, now)
+                               legs, avg_volume, capital, now,
+                               rv=rv, rv_source=rv_source, vix=vix,
+                               max_pain=max_pain)
     print_decision(result)
     log_decision(result)
+    log_iv_history(now, result["atm_iv"])
 
 
 if __name__ == "__main__":

@@ -15,20 +15,24 @@ integration.
 - **`decision_engine.py`** — right now, on the two strikes nearest to
   spot, should I BUY CE, BUY PE, WAIT, or NO TRADE? See "Decision Engine
   v1" below. **Its default answer is WAIT** — a trade only comes out when
-  every one of 6 objective conditions lines up; anything less is WAIT or
+  every one of 7 objective conditions lines up; anything less is WAIT or
   NO TRADE, on purpose.
 
 ## Requirements
 
 ```
 pip install requests
+pip install yfinance           # optional: realized vol + India VIX in decision_engine.py
 python option_analyzer.py     # single strike/expiry analysis
 python decision_engine.py     # right-now BUY CE / BUY PE / WAIT / NO TRADE
 ```
 
 `requests` is only needed for the live NSE fetch; manual entry mode works
 without it in both tools (the fetch failure is caught and reported, then
-falls back to typed input).
+falls back to typed input). `yfinance` is only needed for
+`decision_engine.py`'s realized-volatility condition and India VIX
+context — both degrade gracefully without it (see "Realized vol, India
+VIX, max pain, event days" below).
 
 ## NSE fetch
 
@@ -98,6 +102,12 @@ or RED (0–1/4).
    Guards against holding into the last few days before expiry, where
    theta decay accelerates sharply (gamma/theta risk near expiry).
 
+Greeks display also includes **Gamma** (`bs_greeks()` returns
+`delta, gamma, theta, vega`) alongside Delta/Theta/Vega. When
+`days_to_expiry <= 2`, a "GAMMA-DAY CAUTION" line prints — gamma rises
+sharply into expiry, so small index moves swing the premium hard either
+way.
+
 ## Key constants (`option_analyzer.py` top of file)
 
 - `RISK_FREE_RATE` — annual; update from FBIL/MIBOR periodically.
@@ -134,7 +144,7 @@ line up — it does not predict, and it does not estimate confidence.
 There is **no probability, no confidence percentage, and no expected
 holding time** printed anywhere (`print_decision()` deliberately omits
 them, per the honesty requirements below). A BUY only comes out when
-*all 6* conditions align in the same direction; anything less is WAIT
+*all 7* conditions align in the same direction; anything less is WAIT
 (some conditions conflict) or NO TRADE (a hard blocker is active). In
 practice most runs should say WAIT — that's the tool working as
 intended, not a bug.
@@ -152,7 +162,7 @@ intended, not a bug.
    (`classify_oi_buildup()`): price↑+OI↑ = long buildup, price↓+OI↑ =
    short buildup, price↑+OI↓ = short covering, price↓+OI↓ = long
    unwinding.
-4. Evaluate 6 objective PASS/FAIL conditions (`evaluate_decision()`):
+4. Evaluate 7 objective PASS/FAIL conditions (`evaluate_decision()`):
    1. **OI signal** — bullish if CE shows long buildup and PE shows
       short buildup at both strikes; bearish if reversed; anything else
       is mixed (`classify_oi_signal()`).
@@ -164,7 +174,8 @@ intended, not a bug.
    4. **Premium fairness** — reuses `option_analyzer.bs_price()` /
       `implied_vol()` (via this file's own `resolve_iv()`, since
       `option_analyzer.py` no longer exports a `resolve_iv` helper);
-      candidate premium / BS fair value ≤ 1.10.
+      candidate premium / BS fair value ≤ 1.10, **tightened to ≤ 1.05
+      when India VIX > 17** (`FAIRNESS_THRESHOLD_HIGH_VIX`).
    5. **Risk-reward / breakeven** — SL −30% / T1 +60% is a fixed 2.0 RR;
       separately checks whether the breakeven distance is achievable
       within the *hours left in today's session*
@@ -174,13 +185,21 @@ intended, not a bug.
    6. **Time-of-day filter** — hard NO TRADE during 09:15–09:25 and
       15:00–15:30 IST; 12:00–13:15 IST is flagged as lower quality but
       doesn't block a trade (`time_of_day_status()`).
+   7. **Realized vol vs IV** — candidate IV / 30-day realized vol ≤ 1.10
+      (`RV_IV_THRESHOLD`). RV comes from `fetch_realized_vol()`: 30 daily
+      closes via yfinance (`^NSEBANK`/`^NSEI`), or a manual `closes.csv`
+      fallback (one close per line, oldest first) if yfinance/network is
+      unavailable. **Fails (not "n/a-passes") when no RV data exists at
+      all** — a BUY can never come out of a run with no realized-vol
+      data, by design (see "Realized vol, India VIX, max pain, event
+      days" below).
 5. Decision (`evaluate_decision()`'s branching, in order):
    - Hard blockers → **NO TRADE**: time-of-day filter active, or the
      candidate leg's volume is below the chain average. (A mixed OI
      signal is *not* a separate hard blocker — it fails both the OI and
      PCR conditions at once, which naturally falls through to WAIT via
      the scoring below.)
-   - All 6 conditions pass and direction is bullish → **BUY CE** (nearest
+   - All 7 conditions pass and direction is bullish → **BUY CE** (nearest
      strike above spot). Bearish → **BUY PE** (nearest strike below
      spot).
    - Otherwise → **WAIT**, printing exactly which condition(s) failed
@@ -190,11 +209,44 @@ intended, not a bug.
    risk (`LOT_SIZE = 35`).
 7. Every run — BUY, WAIT, or NO TRADE — is logged to `decisions_log.csv`
    (gitignored) via `log_decision()`: timestamp, spot, both strikes, each
-   condition's value, the alignment score, and the decision.
+   condition's value (including RV, VIX, max pain, event flag), the
+   alignment score, and the decision. Every run also appends today's date
+   + ATM IV to `iv_history.csv` (gitignored) via `log_iv_history()`.
 8. Falls back to manual entry (`manual_entry()`) if the NSE fetch fails —
    typed spot, both strikes, days to expiry, and per-leg premium/IV/OI/OI
    change/price change/volume for all 4 legs, plus the chain-wide average
-   volume.
+   volume. Realized vol / India VIX are fetched independently of the NSE
+   chain (via yfinance), so they're still attempted in manual mode; max
+   pain is not (it needs the full chain, not just 4 legs), so it's `None`
+   in manual mode.
+
+### Realized vol, India VIX, max pain, event days
+
+Four context/condition additions layered on top of the core 6:
+
+- **Realized vol vs IV** (condition 7, above) is the only one of these
+  four that's a scored condition; the other three are context that
+  informs judgment but doesn't gate the decision.
+- **Max pain** (`compute_max_pain()`) — for every strike `Kc` in the
+  fetched chain, `Pain(Kc) = sum(CE_OI(K) * max(Kc-K, 0)) +
+  sum(PE_OI(K) * max(K-Kc, 0))`; the strike that minimizes this is
+  printed as "Max pain: X (spot is Y pts above/below)". Needs the full
+  chain, so it's `None` in manual-entry mode.
+- **India VIX** (`fetch_india_vix()`, via yfinance's `^INDIAVIX`) is
+  printed when available. Above 17 it tightens the premium-fairness
+  threshold from 1.10 to 1.05 (condition 4) and says so in the output.
+  Fetch failures here are **caught and skipped with no message at all**
+  (including yfinance's own internal error print, which is suppressed
+  via `contextlib.redirect_stdout`/`redirect_stderr` around the call) —
+  VIX is pure context, unlike the RV fetch which prints why it failed
+  since a missing RV blocks a BUY.
+- **Event-day flag** (`event_day_status()`) — a hardcoded 2026 event
+  calendar (`EVENT_DATES_2026`: Union Budget, RBI MPC decision dates —
+  **placeholder dates based on RBI's typical bi-monthly cadence; verify
+  against the official RBI MPC calendar at rbi.org.in before relying on
+  this**) plus a dynamic rule (`days_to_expiry <= 1` = expiry day). On a
+  flagged day, prints a prominent "IV-CRUSH RISK" warning and logs it
+  (`event_flag`/`event_label` columns in `decisions_log.csv`).
 
 ### Phase 2 stubs
 
@@ -212,7 +264,7 @@ appending more entries to that list — the score denominator
 - Never prints probability or a confidence percentage.
 - Always shows the header: "Alignment of current structure - not a
   prediction. Direction risk is yours."
-- The score is always labeled "N/6 conditions aligned", never
+- The score is always labeled "N/7 conditions aligned", never
   "confidence".
 
 ## Roadmap
@@ -231,6 +283,13 @@ unless a task explicitly says so):
   last-5-candle price action, OI footprint/absorption) up to a real
   broker API for candle/order-flow data.
 - Backtest Decision Engine v1's condition set against historical chains
-  to see how often 6/6 alignment actually occurs and how it performs.
+  to see how often 7/7 alignment actually occurs and how it performs.
 - A chain-wide scan/ranking mode for `option_analyzer.py` has been tried
   before and reverted; revisit only if explicitly requested.
+- IV rank/percentile once `iv_history.csv` has ~60 days of accumulated
+  ATM IV — not implemented yet, just logged in preparation for it.
+- Verify/correct the placeholder `EVENT_DATES_2026` RBI MPC dates against
+  the official calendar.
+- Cross-rank CE and PE together in one chain scan instead of requiring a
+  side to be picked upfront (carried over from `option_analyzer.py`'s
+  now-reverted scanner idea).
