@@ -12,11 +12,12 @@ integration.
   sanity-check the premium, runs it through 4 pass/fail checks (the
   "verdict"), and estimates how long it would take the premium to hit a
   target gain under an assumed daily point-move.
-- **`decision_engine.py`** — right now, on the two strikes nearest to
-  spot, should I BUY CE, BUY PE, WAIT, or NO TRADE? See "Decision Engine
-  v1" below. **Its default answer is WAIT** — a trade only comes out when
-  every one of 7 objective conditions lines up; anything less is WAIT or
-  NO TRADE, on purpose.
+- **`decision_engine.py`** — right now, should I BUY CE, BUY PE, WAIT, or
+  NO TRADE? Scans the 5 strikes above and 5 below spot and prints up to 3
+  conditional trade cards on the qualifying side. See "Decision Engine
+  v1" below. **Its default answer is WAIT** — a card only comes out for a
+  strike where all 7 objective conditions line up (4 market-wide + 3
+  per-strike); anything less is WAIT or NO TRADE, on purpose.
 
 ## Requirements
 
@@ -134,99 +135,129 @@ way.
 
 ## Decision Engine v1 (`decision_engine.py`)
 
-Answers exactly one question: **right now**, on the two strikes nearest
-spot, is this BUY CE, BUY PE, WAIT, or NO TRADE?
+Scans the 5 strikes above and 5 below spot and, on the directional side,
+prints a qualification table plus up to 3 conditional trade cards.
+Direction itself still comes from just the two nearest strikes, exactly
+as in the original single-candidate version.
 
 ### Philosophy: WAIT is the default answer
 
 This tool reports whether a fixed set of observable conditions currently
 line up — it does not predict, and it does not estimate confidence.
 There is **no probability, no confidence percentage, and no expected
-holding time** printed anywhere (`print_decision()` deliberately omits
-them, per the honesty requirements below). A BUY only comes out when
-*all 7* conditions align in the same direction; anything less is WAIT
-(some conditions conflict) or NO TRADE (a hard blocker is active). In
-practice most runs should say WAIT — that's the tool working as
-intended, not a bug.
+holding time** printed anywhere (`print_scan()` deliberately omits them,
+per the honesty requirements below). A strike only produces a trade card
+when *all 7* conditions align for it — 4 market-wide (shared by every
+strike in a scan) plus 3 of its own; anything less is WAIT (market-wide
+misaligned, or aligned but no strike qualifies) or NO TRADE (a hard
+blocker is active). In practice most runs should print zero cards —
+that's the tool working as intended, not a bug.
+
+### The 7 conditions, split into market-wide (once) and per-strike (each)
+
+**Market-wide** (`evaluate_market_wide()`, computed once from the two
+nearest strikes, unchanged from the original design):
+
+1. **OI signal** — bullish if CE shows long buildup and PE shows short
+   buildup at both nearest strikes; bearish if reversed; anything else
+   is mixed (`classify_oi_signal()`), which fails this condition (not a
+   hard NO TRADE — see decision logic below).
+2. **PCR** — PE OI / CE OI across both nearest strikes; >1.2 bullish,
+   <0.8 bearish, must match the OI signal's direction to pass
+   (`pcr_direction()`).
+3. **Time-of-day filter** — hard NO TRADE during 09:15–09:25 and
+   15:00–15:30 IST; 12:00–13:15 IST is flagged as lower quality but
+   doesn't block a trade (`time_of_day_status()`).
+4. **Realized vol vs ATM IV** — ATM IV (average of CE/PE IV at whichever
+   nearest strike is closer to spot, `compute_atm_iv()`) / 30-day
+   realized vol ≤ 1.10 (`RV_IV_THRESHOLD`). RV comes from
+   `fetch_realized_vol()`: 30 daily closes via yfinance
+   (`^NSEBANK`/`^NSEI`), or a manual `closes.csv` fallback (one close per
+   line, oldest first) if yfinance/network is unavailable. **Fails when
+   no RV data exists at all** — no strike can ever qualify without RV
+   data, by design.
+
+**Per-strike** (`evaluate_strike_conditions()`, evaluated separately for
+every strike in the 5-wide band on the directional side):
+
+5. **Premium fairness** — reuses `option_analyzer.bs_price()` /
+   `implied_vol()` (via this file's own `resolve_iv()`); this strike's
+   premium / BS fair value ≤ 1.10, **tightened to ≤ 1.05 when India VIX
+   > 17** (`FAIRNESS_THRESHOLD_HIGH_VIX`).
+6. **Volume** — this strike's traded volume must exceed the average
+   volume across every leg in the fetched chain.
+7. **Breakeven achievable** — whether the breakeven distance for this
+   strike is achievable within the *hours left in today's session*
+   (`AVG_DAILY_RANGE[symbol] / 6.25h × hours_left`,
+   `hours_left_in_session()`), not days like `option_analyzer.py`'s
+   breakeven check.
+
+A strike **QUALIFIES** only when all 3 of its own conditions pass (and
+market-wide is separately checked before any cards are built).
 
 ### Flow
 
-1. Fetch the chain for the nearest (or chosen) expiry
-   (`fetch_chain()`), reusing `option_analyzer.py`'s `_nse_session()`,
-   `fetch_expiries()`, `pick_expiry()`, `fetch_chain_for_expiry()`,
-   `_find_rows()`, and `_find_underlying()`.
+1. Fetch the chain for the nearest (or chosen) expiry (`fetch_chain()`),
+   reusing `option_analyzer.py`'s `_nse_session()`, `fetch_expiries()`,
+   `pick_expiry()`, `fetch_chain_for_expiry()`, `_find_rows()`, and
+   `_find_underlying()`.
 2. Find the nearest strike below and above spot (`nearest_strikes()`)
-   and pull all 4 legs — CE and PE at both strikes — via
-   `option_analyzer.get_leg()` (`parse_chain_to_legs()`).
-3. Classify each leg's OI buildup from today's price change + OI change
-   (`classify_oi_buildup()`): price↑+OI↑ = long buildup, price↓+OI↑ =
+   and pull all 4 legs via `parse_chain_to_legs()`; evaluate the 4
+   market-wide conditions from them.
+3. Build the 5-above/5-below strike band from whatever strikes actually
+   exist in the fetched chain (`strike_band()`) — not a hardcoded 50/100
+   step. Classify OI buildup for CE and PE at every band strike
+   (`classify_oi_buildup()`: price↑+OI↑ = long buildup, price↓+OI↑ =
    short buildup, price↑+OI↓ = short covering, price↓+OI↓ = long
-   unwinding.
-4. Evaluate 7 objective PASS/FAIL conditions (`evaluate_decision()`):
-   1. **OI signal** — bullish if CE shows long buildup and PE shows
-      short buildup at both strikes; bearish if reversed; anything else
-      is mixed (`classify_oi_signal()`).
-   2. **PCR** — PE OI / CE OI across both strikes; >1.2 bullish, <0.8
-      bearish, must match the OI signal's direction to pass
-      (`pcr_direction()`).
-   3. **Volume** — the candidate leg's traded volume must exceed the
-      average volume across every leg in the fetched chain.
-   4. **Premium fairness** — reuses `option_analyzer.bs_price()` /
-      `implied_vol()` (via this file's own `resolve_iv()`, since
-      `option_analyzer.py` no longer exports a `resolve_iv` helper);
-      candidate premium / BS fair value ≤ 1.10, **tightened to ≤ 1.05
-      when India VIX > 17** (`FAIRNESS_THRESHOLD_HIGH_VIX`).
-   5. **Risk-reward / breakeven** — SL −30% / T1 +60% is a fixed 2.0 RR;
-      separately checks whether the breakeven distance is achievable
-      within the *hours left in today's session*
-      (`AVG_DAILY_RANGE[symbol] / 6.25h × hours_left`,
-      `hours_left_in_session()`), not days like `option_analyzer.py`'s
-      breakeven check.
-   6. **Time-of-day filter** — hard NO TRADE during 09:15–09:25 and
-      15:00–15:30 IST; 12:00–13:15 IST is flagged as lower quality but
-      doesn't block a trade (`time_of_day_status()`).
-   7. **Realized vol vs IV** — candidate IV / 30-day realized vol ≤ 1.10
-      (`RV_IV_THRESHOLD`). RV comes from `fetch_realized_vol()`: 30 daily
-      closes via yfinance (`^NSEBANK`/`^NSEI`), or a manual `closes.csv`
-      fallback (one close per line, oldest first) if yfinance/network is
-      unavailable. **Fails (not "n/a-passes") when no RV data exists at
-      all** — a BUY can never come out of a run with no realized-vol
-      data, by design (see "Realized vol, India VIX, max pain, event
-      days" below).
-5. Decision (`evaluate_decision()`'s branching, in order):
-   - Hard blockers → **NO TRADE**: time-of-day filter active, or the
-     candidate leg's volume is below the chain average. (A mixed OI
-     signal is *not* a separate hard blocker — it fails both the OI and
-     PCR conditions at once, which naturally falls through to WAIT via
-     the scoring below.)
-   - All 7 conditions pass and direction is bullish → **BUY CE** (nearest
-     strike above spot). Bearish → **BUY PE** (nearest strike below
-     spot).
-   - Otherwise → **WAIT**, printing exactly which condition(s) failed
-     and the value that would need to flip.
-6. On a BUY, also prints: entry premium range (LTP ±2%), SL (−30%), T1
-   (+60%), T2 (+100%), and position size from user-entered capital at 1%
-   risk (`LOT_SIZE = 35`).
-7. Every run — BUY, WAIT, or NO TRADE — is logged to `decisions_log.csv`
-   (gitignored) via `log_decision()`: timestamp, spot, both strikes, each
-   condition's value (including RV, VIX, max pain, event flag), the
-   alignment score, and the decision. Every run also appends today's date
-   + ATM IV to `iv_history.csv` (gitignored) via `log_iv_history()`.
-8. Falls back to manual entry (`manual_entry()`) if the NSE fetch fails —
-   typed spot, both strikes, days to expiry, and per-leg premium/IV/OI/OI
-   change/price change/volume for all 4 legs, plus the chain-wide average
-   volume. Realized vol / India VIX are fetched independently of the NSE
-   chain (via yfinance), so they're still attempted in manual mode; max
-   pain is not (it needs the full chain, not just 4 legs), so it's `None`
-   in manual mode.
+   unwinding).
+4. On the directional side only (CEs above if bullish, PEs below if
+   bearish; defaults to CE-above for display if direction is unclear),
+   evaluate the 3 per-strike conditions for all 5 strikes and print a
+   table: strike, premium, IV%, buildup, fairness/volume/breakeven
+   PASS-FAIL, and QUALIFIED yes/no (`scan_band()`, `print_scan()`).
+5. Decision (`scan_band()`'s branching, in order):
+   - Hard blocker → **NO TRADE**: time-of-day filter active. The table
+     still prints; no cards do.
+   - Market-wide not fully aligned (mixed OI, PCR mismatch, or missing
+     RV data) → **WAIT**, printing exactly which market-wide
+     condition(s) failed and their values. Table still prints, no cards.
+   - Market-wide aligned but zero strikes qualify → **WAIT**, saying so
+     explicitly. Table still prints, no cards.
+   - Market-wide aligned and ≥1 strike qualifies → **BUY CE**/**BUY PE**,
+     with up to 3 conditional trade cards (`rank_qualified()`: ranked by
+     conditions passed, then IV/realized-vol ratio ascending, then
+     smallest breakeven distance).
+6. Each trade card (`build_trade_card()`) states:
+   - **Entry trigger**: the nearest strike in the trade's direction from
+     current spot (the same nearest strike used for direction) — the
+     level that would confirm the move.
+   - **Estimated premium at that trigger**: this strike repriced with
+     Black-Scholes at the trigger spot, same IV, minus 1 hour of time
+     decay (`estimate_premium_at_trigger()`, `TRIGGER_DECAY_HOURS`).
+   - Entry range (±3%, `CARD_ENTRY_BAND_PCT`), SL (−30%), target (+60%,
+     T2 +100%), and position size from user-entered capital at 1% risk
+     (`LOT_SIZE = 35`).
+   - A card-specific header: "Conditional plan, not a prediction - valid
+     only if the trigger level is hit while conditions still hold."
+7. Every run is logged to `decisions_log.csv` (gitignored) via
+   `log_scan()`: timestamp, spot, both nearest strikes with their
+   buildups, all market-wide values (RV, VIX, max pain, event flag),
+   which side was scanned, how many strikes qualified (and which), how
+   many cards were issued, and the decision. Every run also appends
+   today's date + ATM IV to `iv_history.csv` (gitignored) via
+   `log_iv_history()`.
+8. Falls back to a **reduced single-strike** manual assessment
+   (`manual_entry()`) if the NSE fetch fails — a full 5+5 scan needs the
+   whole chain (many strikes' OI/volume/premium), which manual entry
+   can't substitute for, the same reasoning as `option_analyzer.py`'s
+   chain scanner. Manual mode still runs the same `scan_band()` machinery
+   with a single-strike band on each side, so it's really just the
+   original v1 single-candidate behavior wearing the new plumbing. Max
+   pain is `None` in manual mode (needs the full chain); realized vol and
+   India VIX are fetched independently via yfinance regardless of mode.
 
 ### Realized vol, India VIX, max pain, event days
 
-Four context/condition additions layered on top of the core 6:
-
-- **Realized vol vs IV** (condition 7, above) is the only one of these
-  four that's a scored condition; the other three are context that
-  informs judgment but doesn't gate the decision.
 - **Max pain** (`compute_max_pain()`) — for every strike `Kc` in the
   fetched chain, `Pain(Kc) = sum(CE_OI(K) * max(Kc-K, 0)) +
   sum(PE_OI(K) * max(K-Kc, 0))`; the strike that minimizes this is
@@ -234,12 +265,13 @@ Four context/condition additions layered on top of the core 6:
   chain, so it's `None` in manual-entry mode.
 - **India VIX** (`fetch_india_vix()`, via yfinance's `^INDIAVIX`) is
   printed when available. Above 17 it tightens the premium-fairness
-  threshold from 1.10 to 1.05 (condition 4) and says so in the output.
-  Fetch failures here are **caught and skipped with no message at all**
-  (including yfinance's own internal error print, which is suppressed
-  via `contextlib.redirect_stdout`/`redirect_stderr` around the call) —
-  VIX is pure context, unlike the RV fetch which prints why it failed
-  since a missing RV blocks a BUY.
+  threshold from 1.10 to 1.05 (per-strike condition 5) and says so in
+  the output. Fetch failures here are **caught and skipped with no
+  message at all** (including yfinance's own internal error print,
+  which is suppressed via `contextlib.redirect_stdout`/`redirect_stderr`
+  around the call) — VIX is pure context, unlike the RV fetch which
+  prints why it failed since missing RV blocks every strike from
+  qualifying.
 - **Event-day flag** (`event_day_status()`) — a hardcoded 2026 event
   calendar: Union Budget (2026-02-01) and the verified FY27 RBI MPC
   announcement dates (`MPC_DATES_2026`: 2026-04-08, 2026-06-05,
@@ -255,18 +287,22 @@ Four context/condition additions layered on top of the core 6:
 `vwap_check()`, `ema_trend()`, `price_action_last5()`, and
 `oi_footprint_absorption()` are defined but each just returns `None` —
 they need broker-supplied candle/order-flow data this tool doesn't have.
-`evaluate_decision()` builds its `conditions` list as plain dicts
-(`{"name", "passed", "detail"}`), so wiring these in later is just
-appending more entries to that list — the score denominator
-(`len(conditions)`) updates automatically, no redesign needed.
+Both `evaluate_market_wide()` and `evaluate_strike_conditions()` build
+their `conditions` lists as plain dicts (`{"name", "passed", "detail"}`),
+so wiring these in later is just appending more entries to the relevant
+list — the score denominators update automatically, no redesign needed.
 
-### Honesty requirements (non-negotiable, enforced in `print_decision()`)
+### Honesty requirements (non-negotiable, enforced in `print_scan()`)
 
 - Never prints expected holding time.
 - Never prints probability or a confidence percentage.
 - Always shows the header: "Alignment of current structure - not a
   prediction. Direction risk is yours."
-- The score is always labeled "N/7 conditions aligned", never
+- Every trade card additionally carries: "Conditional plan, not a
+  prediction - valid only if the trigger level is hit while conditions
+  still hold."
+- Scores are always labeled "N/4 conditions aligned" (market-wide) or
+  shown as PASS/FAIL per condition (per-strike table), never
   "confidence".
 
 ## Roadmap
@@ -285,13 +321,17 @@ unless a task explicitly says so):
   last-5-candle price action, OI footprint/absorption) up to a real
   broker API for candle/order-flow data.
 - Backtest Decision Engine v1's condition set against historical chains
-  to see how often 7/7 alignment actually occurs and how it performs.
+  to see how often any strike qualifies and how the trade cards perform.
 - A chain-wide scan/ranking mode for `option_analyzer.py` has been tried
   before and reverted; revisit only if explicitly requested.
 - IV rank/percentile once `iv_history.csv` has ~60 days of accumulated
   ATM IV — not implemented yet, just logged in preparation for it.
 - `MPC_DATES_2026`/`BUDGET_DATE_2026` only cover 2026; extend with FY28
   dates once RBI publishes its next calendar.
-- Cross-rank CE and PE together in one chain scan instead of requiring a
-  side to be picked upfront (carried over from `option_analyzer.py`'s
+- Cross-rank CE and PE together in one scan instead of requiring a side
+  to be picked upfront (carried over from `option_analyzer.py`'s
   now-reverted scanner idea).
+- Widen the band size (`BAND_SIZE`) or make it configurable per run
+  instead of the fixed 5+5.
+- Track whether a trigger level was actually hit intraday and whether
+  the card's estimated premium held up, to backtest the reprice math.
