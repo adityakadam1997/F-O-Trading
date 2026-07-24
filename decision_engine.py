@@ -1,39 +1,53 @@
 """
-DECISION ENGINE v1 - BankNifty/Nifty options, right now
---------------------------------------------------------
-Answers exactly one question: right now, on the two strikes nearest to
-spot, is this BUY CE, BUY PE, WAIT, or NO TRADE?
+DECISION ENGINE v1 - BankNifty/Nifty options, 5+5 strike scan
+----------------------------------------------------------------
+Scans the 5 strikes above and 5 below spot (whatever strikes actually
+exist in the fetched chain - not a hardcoded 50/100 step) and prints a
+qualification table plus up to 3 conditional trade cards on the
+directional side.
 
-This is NOT a prediction tool. It reports whether a fixed set of
-objective, observable conditions currently point the same way. When they
-don't - which is most of the time - the honest answer is WAIT. There is
-no confidence score, no probability, no expected holding time anywhere
-in this tool; only "N/7 conditions aligned" plus the actual value behind
-each one, so you can see for yourself what's missing.
+This is NOT a prediction tool. Direction still comes from the two
+nearest strikes' OI structure + PCR, exactly as before. Four market-wide
+conditions (OI signal, PCR, time-of-day filter, realized vol vs ATM IV)
+are evaluated once; three per-strike conditions (premium fairness,
+volume vs chain average, breakeven achievable in the hours left today)
+are evaluated separately for every strike in the band on the directional
+side. A strike only QUALIFIES when all 3 of its own conditions pass -
+combined with the market-wide 4, that's the same 7 conditions as before,
+just split into "once" and "per-strike". There is no confidence score,
+no probability, no expected holding time anywhere in this tool.
 
 Flow:
   1. Fetch the option chain for the nearest (or chosen) expiry, reusing
      option_analyzer.py's NSE session/fetch/parsing helpers.
-  2. Find the nearest strike below and above spot; analyze only those
-     two strikes, CE and PE both (4 contracts).
-  3. Classify each leg's OI buildup from today's price change + OI change.
-  4. Evaluate 7 objective conditions (OI signal, PCR, volume vs chain
-     average, premium fairness vs Black-Scholes, risk-reward/breakeven
-     achievable in the hours left today, time-of-day filter, and realized
-     vol vs IV).
-  5. BUY only when all 7 align in one direction. Otherwise WAIT (some
-     conditions conflict) or NO TRADE (volume below average, or a hard
-     no-trade time window is active).
-  6. Alongside the 7 conditions, prints context that doesn't gate the
-     decision but matters for judgment: max pain, India VIX (which also
-     tightens the premium-fairness threshold when elevated), and an
-     event-day/expiry-day IV-crush warning.
+  2. Evaluate the 4 market-wide conditions from the two nearest strikes
+     (unchanged from before) - this fixes direction (bullish/bearish/
+     unclear).
+  3. Classify OI buildup for CE and PE at all 10 band strikes (5 above,
+     5 below spot).
+  4. On the directional side only (CEs above if bullish, PEs below if
+     bearish), evaluate the 3 per-strike conditions for every strike in
+     the band and print a qualification table.
+  5. If market-wide conditions aren't all aligned (or a hard no-trade
+     time window is active), the table still prints but no trade cards
+     do - the printed reason states which market-wide condition is
+     blocking.
+  6. Otherwise, for up to 3 qualified strikes (ranked by conditions
+     passed, then IV/realized-vol ratio, then smallest breakeven
+     distance), print a conditional trade card: the index level that
+     would confirm the move (crossing the adjacent near strike), the
+     Black-Scholes-repriced premium at that trigger level (same IV,
+     minus 1 hour of time decay), entry/SL/targets, and position size.
+     Every card is headed "Conditional plan, not a prediction - valid
+     only if the trigger level is hit while conditions still hold."
 
-Falls back to manual entry (typed spot/strikes/OI/volume/premium per
-leg) if the NSE fetch fails, same as option_analyzer.py. Every run is
-logged to decisions_log.csv (gitignored) regardless of the decision.
-Every run also appends the ATM IV to iv_history.csv (gitignored) so a
-future IV-rank feature has data to work with once ~60 days accumulate.
+Falls back to a reduced single-nearest-strike manual assessment (typed
+spot/strikes/OI/volume/premium for the 4 nearest-strike legs) if the NSE
+fetch fails - a full 5+5 scan needs the whole chain, which manual entry
+can't substitute for, same reasoning as option_analyzer.py's chain
+scanner. Every run is logged to decisions_log.csv (gitignored). Every
+run also appends the ATM IV to iv_history.csv (gitignored) so a future
+IV-rank feature has data to work with once ~60 days accumulate.
 
 Run:  python decision_engine.py
 Needs: pip install requests (NSE fetch), pip install yfinance (realized
@@ -54,7 +68,9 @@ RISK_PCT = 0.01              # 1% of capital risked per trade
 SL_PCT = 0.30                # -30% stop-loss
 T1_PCT = 0.60                # +60% target 1
 T2_PCT = 1.00                # +100% target 2
-ENTRY_BAND_PCT = 0.02        # LTP +/- 2% entry zone
+CARD_ENTRY_BAND_PCT = 0.03   # trade-card estimated premium +/- 3%
+BAND_SIZE = 5                # strikes above and below spot
+TRIGGER_DECAY_HOURS = 1.0    # time decay subtracted when repricing at trigger
 
 MARKET_OPEN = dtime(9, 15)
 MARKET_CLOSE = dtime(15, 30)
@@ -68,7 +84,7 @@ LUNCH_WINDOW = (dtime(12, 0), dtime(13, 15))
 FAIRNESS_THRESHOLD = 1.10           # tightened to 1.05 when India VIX > 17
 FAIRNESS_THRESHOLD_HIGH_VIX = 1.05
 VIX_TIGHTEN_LEVEL = 17.0
-RV_IV_THRESHOLD = 1.10              # option IV / realized vol must be <= this
+RV_IV_THRESHOLD = 1.10              # ATM IV / realized vol must be <= this
 RV_LOOKBACK_DAYS = 30
 
 YF_INDEX_TICKERS = {"BANKNIFTY": "^NSEBANK", "NIFTY": "^NSEI"}
@@ -99,10 +115,11 @@ LOG_FILE = "decisions_log.csv"
 LOG_FIELDS = [
     "timestamp", "symbol", "spot", "strike_below", "strike_above",
     "ce_below_buildup", "ce_above_buildup", "pe_below_buildup",
-    "pe_above_buildup", "pcr", "oi_bias", "volume_ok", "fairness_ratio",
-    "fairness_threshold", "pts_needed", "rv", "rv_source", "iv_rv_ratio",
-    "vix", "max_pain", "event_flag", "event_label", "score", "total",
-    "decision", "candidate_opt", "candidate_strike",
+    "pe_above_buildup", "pcr", "oi_bias", "fairness_threshold", "rv",
+    "rv_source", "iv_rv_ratio", "vix", "max_pain", "event_flag",
+    "event_label", "market_score", "market_total", "side_opt",
+    "strikes_scanned", "num_qualified", "qualified_strikes",
+    "cards_issued", "decision",
 ]
 
 IV_HISTORY_FILE = "iv_history.csv"
@@ -188,6 +205,21 @@ def nearest_strikes(strikes, spot):
     return max(below_list), min(above_list)
 
 
+def all_strikes(rows):
+    return sorted({float(row["strikePrice"]) for row in rows
+                  if row.get("strikePrice") is not None})
+
+
+def strike_band(strikes, spot, n=BAND_SIZE):
+    """The n strikes nearest spot on each side, nearest-first. Reads
+    whatever strikes actually exist in the chain rather than assuming a
+    fixed step (50 for NIFTY / 100 for BANKNIFTY in practice, but this
+    doesn't hardcode that)."""
+    below = sorted([s for s in strikes if s <= spot], reverse=True)[:n]
+    above = sorted([s for s in strikes if s > spot])[:n]
+    return below, above
+
+
 def realized_vol(closes):
     """Annualized realized vol from a list of daily closes (oldest first):
     stdev of log returns * sqrt(252). None if there aren't enough closes
@@ -267,8 +299,7 @@ def compute_max_pain(rows):
     """Strike that minimizes total option-writer payout obligation:
     Pain(Kc) = sum(CE_OI(K) * max(Kc-K, 0)) + sum(PE_OI(K) * max(K-Kc, 0)).
     None if there are fewer than 2 strikes with OI data."""
-    strikes = sorted({float(row["strikePrice"]) for row in rows
-                      if row.get("strikePrice") is not None})
+    strikes = all_strikes(rows)
     if len(strikes) < 2:
         return None
     ce_oi = {float(row["strikePrice"]): (row.get("CE") or {}).get("openInterest") or 0
@@ -337,8 +368,7 @@ def parse_chain_to_legs(rows, S):
     """Pick the two strikes nearest spot out of the fetched rows and
     return (strike_below, strike_above, legs, avg_volume), or None if
     spot isn't bracketed by the available strikes."""
-    strikes = sorted({float(row["strikePrice"]) for row in rows
-                      if row.get("strikePrice") is not None})
+    strikes = all_strikes(rows)
     below, above = nearest_strikes(strikes, S)
     if below is None or above is None:
         return None
@@ -356,8 +386,8 @@ def parse_chain_to_legs(rows, S):
 
 
 # ---- Phase 2 stubs: wired into the conditions list later without a
-# redesign - just append their (name, passed, detail) dicts to the
-# `conditions` list built in evaluate_decision(). Each currently returns
+# redesign - just append their (name, passed, detail) dicts to a
+# conditions list (market-wide or per-strike). Each currently returns
 # None because it needs broker-supplied candle/order-flow data this tool
 # doesn't have access to. ----
 
@@ -381,26 +411,23 @@ def oi_footprint_absorption(*args, **kwargs):
     return None
 
 
-def evaluate_decision(symbol, S, T_days, strike_below, strike_above, legs,
-                      avg_volume, capital, now=None, rv=None, rv_source=None,
-                      vix=None, max_pain=None):
-    """Run the 7 objective conditions on the 4 legs and return a decision
-    dict. `now` is injectable so the time-of-day filter is testable; `rv`
-    (realized vol), `vix` (India VIX), and `max_pain` are injectable too
-    so tests don't need network/yfinance access - callers normally get
-    them from fetch_realized_vol(), fetch_india_vix(), and
-    compute_max_pain()."""
+def evaluate_market_wide(symbol, S, T_days, strike_below, strike_above,
+                         legs_near, now, rv, rv_source, vix, max_pain):
+    """The 4 market-wide conditions (OI signal, PCR, time-of-day, realized
+    vol vs ATM IV), evaluated once from the two nearest strikes - unchanged
+    from earlier versions. `now`/`rv`/`vix`/`max_pain` are all injectable
+    for testing without network/yfinance access."""
     now = now or datetime.now()
     fairness_threshold = (FAIRNESS_THRESHOLD_HIGH_VIX
                           if (vix is not None and vix > VIX_TIGHTEN_LEVEL)
                           else FAIRNESS_THRESHOLD)
     is_event_day, event_label = event_day_status(now, T_days)
-    atm_iv = compute_atm_iv(S, strike_below, strike_above, legs)
+    atm_iv = compute_atm_iv(S, strike_below, strike_above, legs_near)  # in %
 
     buildups = {
         key: classify_oi_buildup(leg.get("pChange") or 0,
                                  leg.get("changeinOpenInterest") or 0)
-        for key, leg in legs.items()
+        for key, leg in legs_near.items()
     }
     ce_below_b = buildups[("CE", "below")]
     ce_above_b = buildups[("CE", "above")]
@@ -409,60 +436,17 @@ def evaluate_decision(symbol, S, T_days, strike_below, strike_above, legs,
 
     oi_bias = classify_oi_signal(ce_below_b, ce_above_b, pe_below_b, pe_above_b)
 
-    ce_oi = ((legs[("CE", "below")].get("openInterest") or 0) +
-             (legs[("CE", "above")].get("openInterest") or 0))
-    pe_oi = ((legs[("PE", "below")].get("openInterest") or 0) +
-             (legs[("PE", "above")].get("openInterest") or 0))
+    ce_oi = ((legs_near[("CE", "below")].get("openInterest") or 0) +
+             (legs_near[("CE", "above")].get("openInterest") or 0))
+    pe_oi = ((legs_near[("PE", "below")].get("openInterest") or 0) +
+             (legs_near[("PE", "above")].get("openInterest") or 0))
     pcr = (pe_oi / ce_oi) if ce_oi else None
     pcr_bias = pcr_direction(pcr)
 
     hard_no_trade, lunch_flag, time_label = time_of_day_status(now)
     direction = oi_bias if oi_bias in ("bullish", "bearish") else None
 
-    if direction == "bullish":
-        candidate_key, candidate_strike = ("CE", "above"), strike_above
-    elif direction == "bearish":
-        candidate_key, candidate_strike = ("PE", "below"), strike_below
-    else:
-        # No clean OI-implied direction. Still pick a nominal candidate so
-        # the per-leg conditions below have something to compute/display -
-        # this can never lead to a BUY since direction is None.
-        candidate_key, candidate_strike = ("CE", "above"), strike_above
-
-    candidate_leg = legs[candidate_key]
-    candidate_opt = candidate_key[0]
-    premium = candidate_leg.get("lastPrice")
-
-    daily_range = oa.AVG_DAILY_RANGE.get(symbol, 200)
-    hours_left = hours_left_in_session(now)
-    achievable_pts = (daily_range / TRADING_HOURS) * hours_left
-
-    volume = candidate_leg.get("totalTradedVolume") or 0
-    volume_ok = volume > avg_volume
-
-    fairness_ratio = None
-    fairness_ok = False
-    pts_needed = None
-    rr_ok = False
-    iv = None
-
-    if premium and premium > 0:
-        T = T_days / 365
-        iv_pct = candidate_leg.get("impliedVolatility") or 0
-        iv = resolve_iv(premium, S, candidate_strike, T, oa.RISK_FREE_RATE,
-                        candidate_opt, iv_pct)
-        if iv:
-            fair = oa.bs_price(S, candidate_strike, T, oa.RISK_FREE_RATE,
-                               iv, candidate_opt)
-            if fair > 0:
-                fairness_ratio = premium / fair
-                fairness_ok = fairness_ratio <= fairness_threshold
-        breakeven = (candidate_strike + premium if candidate_opt == "CE"
-                     else candidate_strike - premium)
-        pts_needed = abs(breakeven - S)
-        rr_ok = hours_left > 0 and pts_needed <= achievable_pts
-
-    iv_rv_ratio = (iv / rv) if (iv and rv) else None
+    iv_rv_ratio = ((atm_iv / 100) / rv) if (atm_iv and rv) else None
     rv_ok = iv_rv_ratio is not None and iv_rv_ratio <= RV_IV_THRESHOLD
 
     conditions = [
@@ -473,173 +457,326 @@ def evaluate_decision(symbol, S, T_days, strike_below, strike_above, legs,
         {"name": "PCR (PE OI / CE OI)",
          "passed": direction is not None and pcr_bias == direction,
          "detail": f"{pcr:.2f}" if pcr is not None else "n/a (CE OI is 0)"},
-        {"name": "Volume vs chain average",
-         "passed": volume_ok,
-         "detail": f"{volume:.0f} vs avg {avg_volume:.0f}"},
-        {"name": f"Premium fairness (prem/fair <= {fairness_threshold:.2f})",
-         "passed": fairness_ok,
-         "detail": f"{fairness_ratio:.2f}" if fairness_ratio is not None else "n/a"},
-        {"name": "Risk-reward / breakeven achievable (RR fixed 2.0)",
-         "passed": rr_ok,
-         "detail": (f"needs {pts_needed:.0f} pts vs {achievable_pts:.0f} pts "
-                    f"achievable in {hours_left:.2f}h left today")
-                   if pts_needed is not None else "n/a"},
         {"name": "Time-of-day filter",
          "passed": not hard_no_trade,
          "detail": time_label},
-        {"name": f"Realized vol vs IV (IV/RV <= {RV_IV_THRESHOLD:.2f})",
+        {"name": f"Realized vol vs ATM IV (IV/RV <= {RV_IV_THRESHOLD:.2f})",
          "passed": rv_ok,
-         "detail": (f"IV {iv * 100:.1f}% / RV {rv * 100:.1f}% "
+         "detail": (f"ATM IV {atm_iv:.1f}% / RV {rv * 100:.1f}% "
                     f"(ratio {iv_rv_ratio:.2f}, source: {rv_source})")
                    if iv_rv_ratio is not None
                    else "n/a (no realized-vol data - install yfinance or provide closes.csv)"},
     ]
     score = sum(1 for c in conditions if c["passed"])
     total = len(conditions)
-
-    if hard_no_trade:
-        decision = "NO TRADE"
-        reason = f"Time-of-day filter active: {time_label}."
-    elif not volume_ok:
-        decision = "NO TRADE"
-        reason = (f"Candidate leg volume ({volume:.0f}) is below the chain "
-                  f"average ({avg_volume:.0f}) - no participation to confirm the move.")
-    elif score == total and direction == "bullish":
-        decision = "BUY CE"
-        reason = f"All {total} conditions align bullish at the nearest strikes."
-    elif score == total and direction == "bearish":
-        decision = "BUY PE"
-        reason = f"All {total} conditions align bearish at the nearest strikes."
-    else:
-        decision = "WAIT"
-        failing = "; ".join(f"{c['name']}: {c['detail']}"
-                            for c in conditions if not c["passed"])
-        reason = f"Not all conditions align yet - {failing}"
+    all_aligned = (score == total) and (direction is not None)
 
     return {
-        "symbol": symbol, "S": S, "T_days": T_days,
+        "symbol": symbol, "S": S, "T_days": T_days, "now": now,
         "strike_below": strike_below, "strike_above": strike_above,
         "buildups": {"CE_below": ce_below_b, "CE_above": ce_above_b,
                      "PE_below": pe_below_b, "PE_above": pe_above_b},
         "oi_bias": oi_bias, "pcr": pcr, "direction": direction,
-        "candidate_opt": candidate_opt, "candidate_strike": candidate_strike,
-        "premium": premium, "conditions": conditions,
-        "score": score, "total": total,
-        "decision": decision, "reason": reason,
-        "lunch_flag": lunch_flag, "capital": capital, "now": now,
-        "fairness_threshold": fairness_threshold,
+        "hard_no_trade": hard_no_trade, "lunch_flag": lunch_flag,
+        "time_label": time_label, "atm_iv": atm_iv,
         "rv": rv, "rv_source": rv_source, "iv_rv_ratio": iv_rv_ratio,
         "vix": vix, "max_pain": max_pain,
+        "fairness_threshold": fairness_threshold,
         "is_event_day": is_event_day, "event_label": event_label,
-        "atm_iv": atm_iv,
+        "conditions": conditions, "score": score, "total": total,
+        "all_aligned": all_aligned,
     }
 
 
-def print_decision(result):
-    print("=" * 70)
-    print("  DECISION ENGINE v1")
+def evaluate_strike_conditions(strike, opt, leg, S, T_days, avg_volume,
+                               fairness_threshold, hours_left, daily_range,
+                               r=None):
+    """The 3 per-strike conditions: premium fairness (VIX-adaptive),
+    volume vs chain average, and breakeven achievable in the hours left
+    today. A strike QUALIFIES only when all 3 pass."""
+    r = oa.RISK_FREE_RATE if r is None else r
+    premium = leg.get("lastPrice")
+    achievable_pts = (daily_range / TRADING_HOURS) * hours_left
+    volume = leg.get("totalTradedVolume") or 0
+    volume_ok = volume > avg_volume
+
+    iv = None
+    fairness_ratio = None
+    fairness_ok = False
+    pts_needed = None
+    breakeven_ok = False
+
+    if premium and premium > 0:
+        T = T_days / 365
+        iv_pct = leg.get("impliedVolatility") or 0
+        iv = resolve_iv(premium, S, strike, T, r, opt, iv_pct)
+        if iv:
+            fair = oa.bs_price(S, strike, T, r, iv, opt)
+            if fair > 0:
+                fairness_ratio = premium / fair
+                fairness_ok = fairness_ratio <= fairness_threshold
+        breakeven = strike + premium if opt == "CE" else strike - premium
+        pts_needed = abs(breakeven - S)
+        breakeven_ok = hours_left > 0 and pts_needed <= achievable_pts
+
+    conditions = [
+        {"name": f"Premium fairness (prem/fair <= {fairness_threshold:.2f})",
+         "passed": fairness_ok,
+         "detail": f"{fairness_ratio:.2f}" if fairness_ratio is not None else "n/a"},
+        {"name": "Volume vs chain average",
+         "passed": volume_ok,
+         "detail": f"{volume:.0f} vs avg {avg_volume:.0f}"},
+        {"name": "Breakeven achievable (remaining hours)",
+         "passed": breakeven_ok,
+         "detail": (f"needs {pts_needed:.0f} pts vs {achievable_pts:.0f} pts "
+                    f"achievable in {hours_left:.2f}h left")
+                   if pts_needed is not None else "n/a"},
+    ]
+    passed_count = sum(1 for c in conditions if c["passed"])
+    qualified = (passed_count == len(conditions) and premium is not None
+                and premium > 0 and iv is not None)
+
+    return {
+        "strike": strike, "opt": opt, "premium": premium, "iv": iv,
+        "fairness_ratio": fairness_ratio, "volume": volume,
+        "pts_needed": pts_needed, "achievable_pts": achievable_pts,
+        "conditions": conditions, "passed_count": passed_count,
+        "qualified": qualified,
+    }
+
+
+def estimate_premium_at_trigger(trigger_S, K, T_days, iv, opt, r=None):
+    """Reprice with Black-Scholes at the trigger spot level, same IV,
+    minus TRIGGER_DECAY_HOURS of time decay."""
+    r = oa.RISK_FREE_RATE if r is None else r
+    T_new_days = max(T_days - TRIGGER_DECAY_HOURS / 24.0, 0.0)
+    return oa.bs_price(trigger_S, K, T_new_days / 365, r, iv, opt)
+
+
+def rank_qualified(qualified_results, rv):
+    """Ranked by conditions passed (always equal among qualified strikes,
+    since qualification requires all 3), then IV/realized-vol ratio
+    ascending (cheaper vs realized vol wins), then smallest breakeven
+    distance. Top 3."""
+    def key(res):
+        iv_rv = (res["iv"] / rv) if (res["iv"] and rv) else float("inf")
+        pts = res["pts_needed"] if res["pts_needed"] is not None else float("inf")
+        return (-res["passed_count"], iv_rv, pts)
+    return sorted(qualified_results, key=key)[:3]
+
+
+def build_trade_card(strike_result, trigger, opt, capital, T_days):
+    est_premium = estimate_premium_at_trigger(trigger, strike_result["strike"],
+                                              T_days, strike_result["iv"], opt)
+    lo = est_premium * (1 - CARD_ENTRY_BAND_PCT)
+    hi = est_premium * (1 + CARD_ENTRY_BAND_PCT)
+    sl = est_premium * (1 - SL_PCT)
+    t1 = est_premium * (1 + T1_PCT)
+    t2 = est_premium * (1 + T2_PCT)
+    risk_per_lot = (est_premium - sl) * LOT_SIZE
+    max_risk = capital * RISK_PCT
+    lots = int(max_risk // risk_per_lot) if risk_per_lot > 0 else 0
+    return {
+        "strike": strike_result["strike"], "opt": opt, "trigger": trigger,
+        "est_premium": est_premium, "lo": lo, "hi": hi, "sl": sl,
+        "t1": t1, "t2": t2, "risk_per_lot": risk_per_lot, "lots": lots,
+        "max_risk": max_risk,
+    }
+
+
+def build_band_lookup(rows):
+    """Chain-mode leg lookup: (strike, opt) -> leg dict, via
+    option_analyzer.get_leg()."""
+    def lookup(strike, opt):
+        return oa.get_leg(rows, strike, opt)
+    return lookup
+
+
+def scan_band(symbol, S, T_days, strike_below, strike_above, legs_near,
+             avg_volume, capital, now, rv, rv_source, vix, max_pain,
+             band_lookup, band_below_strikes, band_above_strikes):
+    """Core scan: market-wide conditions once, then per-strike
+    qualification over whichever band (5 above or 5 below, or a
+    single-strike band in manual mode) matches the resulting direction.
+    Returns a result dict for print_scan()/log_scan()."""
+    market = evaluate_market_wide(symbol, S, T_days, strike_below,
+                                  strike_above, legs_near, now, rv,
+                                  rv_source, vix, max_pain)
+    daily_range = oa.AVG_DAILY_RANGE.get(symbol, 200)
+    hours_left = hours_left_in_session(market["now"])
+    direction = market["direction"]
+
+    if direction == "bullish":
+        side_opt, side_strikes = "CE", band_above_strikes
+    elif direction == "bearish":
+        side_opt, side_strikes = "PE", band_below_strikes
+    else:
+        # No clean direction; still scan a nominal side purely for display.
+        side_opt, side_strikes = "CE", band_above_strikes
+
+    strike_results = []
+    for k in side_strikes:
+        leg = band_lookup(k, side_opt) or {}
+        buildup = classify_oi_buildup(leg.get("pChange") or 0,
+                                      leg.get("changeinOpenInterest") or 0)
+        res = evaluate_strike_conditions(k, side_opt, leg, S, T_days,
+                                         avg_volume, market["fairness_threshold"],
+                                         hours_left, daily_range)
+        res["buildup"] = buildup
+        strike_results.append(res)
+
+    qualified = [r for r in strike_results if r["qualified"]]
+    ranked = rank_qualified(qualified, market["rv"]) if qualified else []
+    trigger = (strike_above if direction == "bullish" else
+              strike_below if direction == "bearish" else None)
+
+    if market["hard_no_trade"]:
+        decision = "NO TRADE"
+        reason = f"Time-of-day filter active: {market['time_label']}."
+        cards = []
+    elif not market["all_aligned"]:
+        failing = "; ".join(f"{c['name']}: {c['detail']}"
+                            for c in market["conditions"] if not c["passed"])
+        decision = "WAIT"
+        reason = f"Market-wide conditions not aligned - {failing}"
+        cards = []
+    elif not ranked:
+        decision = "WAIT"
+        reason = (f"Market-wide aligned {direction} but no strike in the "
+                  "band met the per-strike bar (fairness/volume/breakeven).")
+        cards = []
+    else:
+        decision = "BUY CE" if direction == "bullish" else "BUY PE"
+        reason = (f"Market-wide aligned {direction}; {len(ranked)} strike(s) "
+                  "qualified - see conditional trade card(s) below.")
+        cards = [build_trade_card(r, trigger, side_opt, capital, T_days)
+                for r in ranked]
+
+    return {
+        "market": market, "side_opt": side_opt, "strike_results": strike_results,
+        "qualified": qualified, "ranked": ranked, "trigger": trigger,
+        "decision": decision, "reason": reason, "cards": cards, "capital": capital,
+    }
+
+
+def print_scan(result):
+    m = result["market"]
+    print("=" * 78)
+    print("  DECISION ENGINE v1 - 5+5 STRIKE SCAN")
     print("  Alignment of current structure - not a prediction. Direction risk is yours.")
-    print("=" * 70)
-    print(f"  Symbol: {result['symbol']}   Spot: {result['S']}   "
-          f"Days to expiry: {result['T_days']}")
-    print(f"  Nearest strikes: {result['strike_below']:.0f} (below) / "
-          f"{result['strike_above']:.0f} (above)")
-    print("-" * 70)
-    b = result["buildups"]
-    print("  OI BUILDUP (today's price change + OI change):")
-    print(f"    CE {result['strike_below']:.0f}: {b['CE_below']}")
-    print(f"    CE {result['strike_above']:.0f}: {b['CE_above']}")
-    print(f"    PE {result['strike_below']:.0f}: {b['PE_below']}")
-    print(f"    PE {result['strike_above']:.0f}: {b['PE_above']}")
-    print("-" * 70)
-    if result["max_pain"] is not None:
-        diff = result["S"] - result["max_pain"]
-        direction = "above" if diff > 0 else "below" if diff < 0 else "at"
-        print(f"  Max pain: {result['max_pain']:.0f} (spot is {abs(diff):.0f} "
-              f"pts {direction} max pain)")
-    if result["vix"] is not None:
+    print("=" * 78)
+    print(f"  Symbol: {m['symbol']}   Spot: {m['S']}   Days to expiry: {m['T_days']}")
+    print(f"  Nearest strikes: {m['strike_below']:.0f} (below) / "
+          f"{m['strike_above']:.0f} (above)")
+    print("-" * 78)
+    b = m["buildups"]
+    print("  OI BUILDUP at nearest strikes (drives direction):")
+    print(f"    CE {m['strike_below']:.0f}: {b['CE_below']}   |   "
+          f"CE {m['strike_above']:.0f}: {b['CE_above']}")
+    print(f"    PE {m['strike_below']:.0f}: {b['PE_below']}   |   "
+          f"PE {m['strike_above']:.0f}: {b['PE_above']}")
+    print("-" * 78)
+    if m["max_pain"] is not None:
+        diff = m["S"] - m["max_pain"]
+        dword = "above" if diff > 0 else "below" if diff < 0 else "at"
+        print(f"  Max pain: {m['max_pain']:.0f} (spot is {abs(diff):.0f} "
+              f"pts {dword} max pain)")
+    if m["vix"] is not None:
         tightened = (" (premium-fairness threshold tightened to "
                     f"{FAIRNESS_THRESHOLD_HIGH_VIX:.2f})"
-                    if result["fairness_threshold"] < FAIRNESS_THRESHOLD else "")
-        print(f"  India VIX: {result['vix']:.2f}{tightened}")
-    if result["is_event_day"]:
-        print(f"  *** IV-CRUSH RISK: {result['event_label']} - IV can collapse "
+                    if m["fairness_threshold"] < FAIRNESS_THRESHOLD else "")
+        print(f"  India VIX: {m['vix']:.2f}{tightened}")
+    if m["is_event_day"]:
+        print(f"  *** IV-CRUSH RISK: {m['event_label']} - IV can collapse "
               "independent of direction. ***")
-    if result["max_pain"] is not None or result["vix"] is not None or result["is_event_day"]:
-        print("-" * 70)
-    print("  CONDITIONS:")
-    for c in result["conditions"]:
+    print("-" * 78)
+    print("  MARKET-WIDE CONDITIONS (evaluated once):")
+    for c in m["conditions"]:
         print(f"    [{'PASS' if c['passed'] else 'FAIL'}] {c['name']}  ({c['detail']})")
-    print("-" * 70)
-    print(f"  ALIGNMENT SCORE: {result['score']}/{result['total']} "
-          "conditions aligned")
+    unclear = "  (direction unclear)" if m["direction"] is None else ""
+    print(f"  Market-wide alignment: {m['score']}/{m['total']} "
+          f"conditions aligned{unclear}")
+    if m["lunch_flag"]:
+        print("  NOTE: 12:00-13:15 IST lull window - lower quality setup, "
+              "size down or wait even if cards are printed below.")
+    print("-" * 78)
+
+    side_word = "above" if result["side_opt"] == "CE" else "below"
+    print(f"  STRIKE SCAN ({result['side_opt']} {side_word} spot, "
+          f"{len(result['strike_results'])} strike(s)):")
+    header = (f"  {'Strike':<9}{'Premium':<10}{'IV%':<7}{'Buildup':<16}"
+              f"{'Fair':<6}{'Vol':<6}{'BE':<6}{'QUALIFIED':<10}")
+    print(header)
+    print("  " + "-" * 74)
+    for r in result["strike_results"]:
+        iv_str = f"{r['iv'] * 100:.1f}" if r["iv"] else "n/a"
+        prem_str = f"{r['premium']:.1f}" if r["premium"] else "n/a"
+        fairness_pass, volume_pass, be_pass = (c["passed"] for c in r["conditions"])
+        print(f"  {r['strike']:<9.0f}{prem_str:<10}{iv_str:<7}{r['buildup']:<16}"
+              f"{'PASS' if fairness_pass else 'FAIL':<6}"
+              f"{'PASS' if volume_pass else 'FAIL':<6}"
+              f"{'PASS' if be_pass else 'FAIL':<6}"
+              f"{'YES' if r['qualified'] else 'no':<10}")
+    print("  " + "-" * 74)
     print(f"  DECISION: {result['decision']}")
     print(f"  Reason: {result['reason']}")
-    if result["lunch_flag"]:
-        print("  NOTE: 12:00-13:15 IST lull window - lower quality setup, "
-              "size down or wait even if the decision above is BUY.")
 
-    if result["decision"] in ("BUY CE", "BUY PE"):
-        premium = result["premium"]
-        lo, hi = premium * (1 - ENTRY_BAND_PCT), premium * (1 + ENTRY_BAND_PCT)
-        sl = premium * (1 - SL_PCT)
-        t1 = premium * (1 + T1_PCT)
-        t2 = premium * (1 + T2_PCT)
-        risk_per_lot = (premium - sl) * LOT_SIZE
-        max_risk = result["capital"] * RISK_PCT
-        lots = int(max_risk // risk_per_lot) if risk_per_lot > 0 else 0
-        print("-" * 70)
-        print(f"  Candidate: {result['symbol']} {result['candidate_strike']:.0f} "
-              f"{result['candidate_opt']}")
-        print(f"  Entry premium range (LTP +/- 2%): Rs {lo:.1f} - Rs {hi:.1f}")
-        print(f"  SL (-30%): Rs {sl:.1f}   T1 (+60%): Rs {t1:.1f}   "
-              f"T2 (+100%): Rs {t2:.1f}")
-        if lots > 0:
-            print(f"  Position size at 1% risk on Rs {result['capital']:.0f} "
-                  f"capital: {lots} lot(s) (lot size {LOT_SIZE}), risking "
-                  f"Rs {risk_per_lot * lots:.0f}")
-        else:
-            print(f"  Position size: 0 lots - risk per lot (Rs {risk_per_lot:.0f}) "
-                  f"exceeds 1% of capital (Rs {max_risk:.0f}).")
-    print("=" * 70)
+    if result["cards"]:
+        print("=" * 78)
+        for i, card in enumerate(result["cards"], 1):
+            print(f"  CARD #{i}: {m['symbol']} {card['strike']:.0f} {card['opt']}")
+            print("  Conditional plan, not a prediction - valid only if the "
+                  "trigger level is hit while conditions still hold.")
+            print(f"  IF {m['symbol']} reaches {card['trigger']:.0f}: buy "
+                  f"{card['strike']:.0f} {card['opt']} around "
+                  f"Rs {card['lo']:.1f}-{card['hi']:.1f}, SL Rs {card['sl']:.1f}, "
+                  f"target Rs {card['t1']:.1f} (T2 Rs {card['t2']:.1f})")
+            if card["lots"] > 0:
+                print(f"  Lots for Rs {result['capital']:.0f} capital at 1% risk: "
+                      f"{card['lots']} lot(s) (lot size {LOT_SIZE}), risking "
+                      f"Rs {card['risk_per_lot'] * card['lots']:.0f}")
+            else:
+                print(f"  Position size: 0 lots - risk per lot "
+                      f"(Rs {card['risk_per_lot']:.0f}) exceeds 1% of capital "
+                      f"(Rs {card['max_risk']:.0f}).")
+            if i < len(result["cards"]):
+                print("-" * 78)
+    print("=" * 78)
 
 
-def log_decision(result, path=LOG_FILE):
-    fairness_detail = next(c["detail"] for c in result["conditions"]
-                           if c["name"].startswith("Premium fairness"))
-    pts_detail = next(c["detail"] for c in result["conditions"]
-                      if c["name"].startswith("Risk-reward"))
-    volume_ok = next(c["passed"] for c in result["conditions"]
-                     if c["name"] == "Volume vs chain average")
+def log_scan(result, path=LOG_FILE):
+    m = result["market"]
+    qualified_strikes = ";".join(f"{r['strike']:.0f}{result['side_opt']}"
+                                 for r in result["qualified"])
     row = {
-        "timestamp": result["now"].isoformat(timespec="seconds"),
-        "symbol": result["symbol"],
-        "spot": result["S"],
-        "strike_below": result["strike_below"],
-        "strike_above": result["strike_above"],
-        "ce_below_buildup": result["buildups"]["CE_below"],
-        "ce_above_buildup": result["buildups"]["CE_above"],
-        "pe_below_buildup": result["buildups"]["PE_below"],
-        "pe_above_buildup": result["buildups"]["PE_above"],
-        "pcr": f"{result['pcr']:.3f}" if result["pcr"] is not None else "",
-        "oi_bias": result["oi_bias"],
-        "volume_ok": volume_ok,
-        "fairness_ratio": fairness_detail,
-        "fairness_threshold": result["fairness_threshold"],
-        "pts_needed": pts_detail,
-        "rv": f"{result['rv']:.4f}" if result["rv"] is not None else "",
-        "rv_source": result["rv_source"] or "",
-        "iv_rv_ratio": (f"{result['iv_rv_ratio']:.2f}"
-                       if result["iv_rv_ratio"] is not None else ""),
-        "vix": f"{result['vix']:.2f}" if result["vix"] is not None else "",
-        "max_pain": result["max_pain"] if result["max_pain"] is not None else "",
-        "event_flag": result["is_event_day"],
-        "event_label": result["event_label"] or "",
-        "score": result["score"],
-        "total": result["total"],
+        "timestamp": m["now"].isoformat(timespec="seconds"),
+        "symbol": m["symbol"],
+        "spot": m["S"],
+        "strike_below": m["strike_below"],
+        "strike_above": m["strike_above"],
+        "ce_below_buildup": m["buildups"]["CE_below"],
+        "ce_above_buildup": m["buildups"]["CE_above"],
+        "pe_below_buildup": m["buildups"]["PE_below"],
+        "pe_above_buildup": m["buildups"]["PE_above"],
+        "pcr": f"{m['pcr']:.3f}" if m["pcr"] is not None else "",
+        "oi_bias": m["oi_bias"],
+        "fairness_threshold": m["fairness_threshold"],
+        "rv": f"{m['rv']:.4f}" if m["rv"] is not None else "",
+        "rv_source": m["rv_source"] or "",
+        "iv_rv_ratio": (f"{m['iv_rv_ratio']:.2f}"
+                       if m["iv_rv_ratio"] is not None else ""),
+        "vix": f"{m['vix']:.2f}" if m["vix"] is not None else "",
+        "max_pain": m["max_pain"] if m["max_pain"] is not None else "",
+        "event_flag": m["is_event_day"],
+        "event_label": m["event_label"] or "",
+        "market_score": m["score"],
+        "market_total": m["total"],
+        "side_opt": result["side_opt"],
+        "strikes_scanned": len(result["strike_results"]),
+        "num_qualified": len(result["qualified"]),
+        "qualified_strikes": qualified_strikes,
+        "cards_issued": len(result["cards"]),
         "decision": result["decision"],
-        "candidate_opt": result["candidate_opt"],
-        "candidate_strike": result["candidate_strike"],
     }
     write_header = not os.path.exists(path)
     with open(path, "a", newline="") as f:
@@ -695,10 +832,10 @@ def manual_entry():
 
 
 def main():
-    print("=" * 70)
-    print("  DECISION ENGINE v1")
+    print("=" * 78)
+    print("  DECISION ENGINE v1 - 5+5 STRIKE SCAN")
     print("  Alignment of current structure - not a prediction. Direction risk is yours.")
-    print("=" * 70)
+    print("=" * 78)
     symbol = (input("Index (NIFTY / BANKNIFTY) [BANKNIFTY]: ").strip().upper()
               or "BANKNIFTY")
     capital_in = input("Trading capital (Rs) for position sizing [100000]: ").strip()
@@ -708,27 +845,38 @@ def main():
     rows, S, expiry = fetch_chain(symbol)
     max_pain = None
     if rows is None:
-        S, T_days, strike_below, strike_above, legs, avg_volume = manual_entry()
+        print("\n  5+5 strike scan needs a live NSE fetch (it has to see many")
+        print("  strikes at once) - manual entry can't substitute for that.")
+        print("  Falling back to a reduced single-nearest-strike assessment.\n")
+        S, T_days, strike_below, strike_above, legs_near, avg_volume = manual_entry()
+        band_below_strikes, band_above_strikes = [strike_below], [strike_above]
+
+        def band_lookup(strike, opt):
+            slot = "below" if strike == strike_below else "above"
+            return legs_near.get((opt, slot), {})
     else:
         parsed = parse_chain_to_legs(rows, S)
         if parsed is None:
             print("Spot price is outside the strikes available in the chain.")
             return
-        strike_below, strike_above, legs, avg_volume = parsed
+        strike_below, strike_above, legs_near, avg_volume = parsed
         T_days = oa.days_between(expiry)
         max_pain = compute_max_pain(rows)
+        strikes = all_strikes(rows)
+        band_below_strikes, band_above_strikes = strike_band(strikes, S)
+        band_lookup = build_band_lookup(rows)
         print(f"\nFetched: spot={S}, expiry={expiry}, days to expiry={T_days}")
 
     rv, rv_source = fetch_realized_vol(symbol)
     vix = fetch_india_vix()
 
-    result = evaluate_decision(symbol, S, T_days, strike_below, strike_above,
-                               legs, avg_volume, capital, now,
-                               rv=rv, rv_source=rv_source, vix=vix,
-                               max_pain=max_pain)
-    print_decision(result)
-    log_decision(result)
-    log_iv_history(now, result["atm_iv"])
+    result = scan_band(symbol, S, T_days, strike_below, strike_above,
+                       legs_near, avg_volume, capital, now, rv, rv_source,
+                       vix, max_pain, band_lookup, band_below_strikes,
+                       band_above_strikes)
+    print_scan(result)
+    log_scan(result)
+    log_iv_history(now, result["market"]["atm_iv"])
 
 
 if __name__ == "__main__":

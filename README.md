@@ -21,8 +21,8 @@ python option_analyzer.py
 
 ### `decision_engine.py`
 
-**Right now**, on the two strikes nearest to spot, should you BUY CE,
-BUY PE, WAIT, or NO TRADE?
+Scans the **5 strikes above and 5 below spot** and prints up to 3
+conditional trade cards on whichever side the market is aligned toward.
 
 ```
 pip install requests
@@ -30,18 +30,42 @@ pip install yfinance   # optional: realized vol + India VIX
 python decision_engine.py
 ```
 
-It checks 7 objective conditions — OI buildup direction, PCR, volume vs
-the chain average, premium fairness vs Black-Scholes, whether the
-breakeven distance is achievable in the hours left in today's session, a
-time-of-day filter, and realized volatility vs IV — and only says BUY
-when **all 7** line up in the same direction.
+Direction is decided the same way as before - from the two strikes
+nearest spot - via 4 **market-wide** conditions checked once: OI buildup
+direction, PCR, a time-of-day filter, and realized volatility vs ATM IV.
+Then, only on the directional side (CEs above spot if bullish, PEs below
+if bearish), each of the 5 band strikes is checked against 3 of its own
+**per-strike** conditions: premium fairness vs Black-Scholes, volume vs
+the chain average, and whether its breakeven distance is achievable in
+the hours left in today's session. A strike only **QUALIFIES** when all
+3 of its own conditions pass - combined with the 4 market-wide ones,
+that's the same 7 conditions as the original single-candidate design,
+just split into "once" and "per-strike".
+
+A printed table always shows all 5 band strikes (premium, IV, OI
+buildup, fairness/volume/breakeven PASS-FAIL, QUALIFIED yes/no) — even
+when market-wide conditions aren't aligned, so you can see why. Trade
+cards only print when market-wide is fully aligned **and** at least one
+strike qualifies (up to 3, ranked by conditions passed, then
+IV/realized-vol ratio, then smallest breakeven distance). Each card
+gives:
+
+- **Entry trigger** — the nearest strike in the trade's direction from
+  current spot; crossing it is what would confirm the move.
+- **Estimated premium at that trigger** — the strike repriced with
+  Black-Scholes at the trigger level, same IV, minus 1 hour of time
+  decay.
+- Entry range (±3%), stop-loss (−30%), target (+60%, T2 +100%), and
+  position size from your capital at 1% risk.
+- Its own header: "Conditional plan, not a prediction - valid only if
+  the trigger level is hit while conditions still hold."
 
 **WAIT is the default answer.** This is not a prediction tool: it never
 prints a confidence score, a probability, or an expected holding time —
-only which of the 7 conditions currently align and their actual values.
-Most runs, honestly, should come back WAIT.
+only which conditions currently align and their actual values. Most
+runs, honestly, should print zero cards.
 
-Alongside those 7 conditions it also prints context that doesn't gate the
+Alongside all of this it also prints context that doesn't gate the
 decision but matters for judgment:
 
 - **Max pain** — the strike that minimizes total option-writer payout,
@@ -55,15 +79,19 @@ decision but matters for judgment:
 Realized volatility comes from 30 daily closes via `yfinance`
 (`^NSEBANK`/`^NSEI`), or a manual `closes.csv` fallback (one close per
 line, oldest first) if `yfinance`/network access isn't available. Unlike
-the other three additions, realized vol is a **required** condition —
-without RV data the run can never reach 7/7, so it can never produce a
-BUY.
+the other three additions, realized vol is a **required** market-wide
+condition — without RV data no strike can ever qualify for a card.
 
-Every run (BUY, WAIT, or NO TRADE) is logged to `decisions_log.csv` for
-later review; that file is gitignored. Every run also appends today's
-date + ATM IV to `iv_history.csv` (also gitignored) — an IV-rank/
-percentile feature will activate once that file accumulates roughly 60
-days of history; it isn't implemented yet.
+If the live NSE fetch fails, a full 5+5 scan can't be substituted with
+manual entry (it needs the whole chain), so it falls back to a reduced
+single-strike assessment - the same nearest-strike behavior the tool
+originally had.
+
+Every run is logged to `decisions_log.csv` for later review; that file
+is gitignored. Every run also appends today's date + ATM IV to
+`iv_history.csv` (also gitignored) — an IV-rank/percentile feature will
+activate once that file accumulates roughly 60 days of history; it isn't
+implemented yet.
 
 ## NSE fetch
 
